@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::keychain::KeychainStore;
 use crate::steamcmd::{LoginSession, SteamCmdClient, SteamCmdError};
 
 // ─── State Machine ─────────────────────────────────────────────────────────
@@ -137,14 +138,16 @@ pub trait OnboardingSaga: Send + Sync + 'static {
 
 pub struct RealOnboardingSaga {
     steamcmd: Arc<dyn SteamCmdClient>,
+    keychain: Arc<dyn KeychainStore>,
     http_client: reqwest::Client,
     state: Mutex<OnboardingState>,
 }
 
 impl RealOnboardingSaga {
-    pub fn new(steamcmd: Arc<dyn SteamCmdClient>) -> Self {
+    pub fn new(steamcmd: Arc<dyn SteamCmdClient>, keychain: Arc<dyn KeychainStore>) -> Self {
         Self {
             steamcmd,
+            keychain,
             http_client: reqwest::Client::new(),
             state: Mutex::new(OnboardingState::Initial),
         }
@@ -308,8 +311,10 @@ impl OnboardingSaga for RealOnboardingSaga {
             }
         };
 
-        // TODO: write to macOS Keychain via security-framework crate
-        // For now: placeholder that succeeds
+        self.keychain
+            .save(steam_id, &username, &api_key)
+            .map_err(OnboardingError::PersistFailed)?;
+
         let next = OnboardingState::Complete {
             steam_id,
             username,
@@ -320,7 +325,7 @@ impl OnboardingSaga for RealOnboardingSaga {
     }
 
     async fn compensate(&self) {
-        // TODO: clear Keychain entries, kill any lingering SteamCMD processes
+        self.keychain.clear();
         self.set_state(OnboardingState::Initial).await;
     }
 
@@ -334,20 +339,27 @@ impl OnboardingSaga for RealOnboardingSaga {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keychain::MockKeychainStore;
     use crate::steamcmd::client::MockSteamCmdClient;
+
+    fn make_saga(
+        steamcmd: MockSteamCmdClient,
+        keychain: MockKeychainStore,
+    ) -> RealOnboardingSaga {
+        RealOnboardingSaga::new(Arc::new(steamcmd), Arc::new(keychain))
+    }
 
     #[tokio::test]
     async fn login_transitions_to_api_key_pending_on_success() {
         let mut mock = MockSteamCmdClient::new();
-        mock.expect_login()
-            .returning(|username, _password| {
-                Ok(LoginSession {
-                    steam_id: 76561198000000001,
-                    username: username.to_string(),
-                })
-            });
+        mock.expect_login().returning(|username, _password| {
+            Ok(LoginSession {
+                steam_id: 76561198000000001,
+                username: username.to_string(),
+            })
+        });
 
-        let saga = RealOnboardingSaga::new(Arc::new(mock));
+        let saga = make_saga(mock, MockKeychainStore::new());
         let state = saga.login("testuser", "testpass").await.unwrap();
 
         assert!(matches!(
@@ -365,7 +377,7 @@ mod tests {
         mock.expect_login()
             .returning(|_, _| Err(SteamCmdError::SteamGuardRequired));
 
-        let saga = RealOnboardingSaga::new(Arc::new(mock));
+        let saga = make_saga(mock, MockKeychainStore::new());
         let err = saga.login("testuser", "testpass").await.unwrap_err();
 
         assert!(matches!(err, OnboardingError::SteamGuardRequired));
@@ -381,20 +393,25 @@ mod tests {
         mock.expect_login()
             .returning(|_, _| Err(SteamCmdError::LoginFailed("Invalid password".into())));
 
-        let saga = RealOnboardingSaga::new(Arc::new(mock));
+        let saga = make_saga(mock, MockKeychainStore::new());
         let err = saga.login("testuser", "wrongpass").await.unwrap_err();
 
         assert!(matches!(err, OnboardingError::LoginFailed(_)));
         assert!(matches!(
             saga.current_state(),
-            OnboardingState::Failed { step: OnboardingStep::SteamCmdLogin, .. }
+            OnboardingState::Failed {
+                step: OnboardingStep::SteamCmdLogin,
+                ..
+            }
         ));
     }
 
     #[tokio::test]
-    async fn compensate_resets_to_initial() {
-        let mock = MockSteamCmdClient::new();
-        let saga = RealOnboardingSaga::new(Arc::new(mock));
+    async fn compensate_clears_keychain_and_resets_to_initial() {
+        let mut keychain = MockKeychainStore::new();
+        keychain.expect_clear().times(1).return_const(());
+
+        let saga = make_saga(MockSteamCmdClient::new(), keychain);
         saga.set_state(OnboardingState::SteamGuardPending {
             username: "user".into(),
         })
@@ -403,5 +420,48 @@ mod tests {
         saga.compensate().await;
 
         assert_eq!(saga.current_state(), OnboardingState::Initial);
+    }
+
+    #[tokio::test]
+    async fn persist_saves_to_keychain_and_transitions_to_complete() {
+        let mut keychain = MockKeychainStore::new();
+        keychain
+            .expect_save()
+            .withf(|&steam_id, username, api_key| {
+                steam_id == 76561198000000001 && username == "testuser" && api_key == "APIKEY123"
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+
+        let saga = make_saga(MockSteamCmdClient::new(), keychain);
+        saga.set_state(OnboardingState::CrossValidationPending {
+            steam_id: 76561198000000001,
+            username: "testuser".into(),
+            api_key: "APIKEY123".into(),
+        })
+        .await;
+
+        let state = saga.persist().await.unwrap();
+        assert!(matches!(state, OnboardingState::Complete { .. }));
+        assert!(matches!(saga.current_state(), OnboardingState::Complete { .. }));
+    }
+
+    #[tokio::test]
+    async fn persist_propagates_keychain_error() {
+        let mut keychain = MockKeychainStore::new();
+        keychain
+            .expect_save()
+            .returning(|_, _, _| Err("Keychain locked".into()));
+
+        let saga = make_saga(MockSteamCmdClient::new(), keychain);
+        saga.set_state(OnboardingState::CrossValidationPending {
+            steam_id: 1,
+            username: "u".into(),
+            api_key: "k".into(),
+        })
+        .await;
+
+        let err = saga.persist().await.unwrap_err();
+        assert!(matches!(err, OnboardingError::PersistFailed(_)));
     }
 }

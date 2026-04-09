@@ -13,6 +13,8 @@ pub struct RealSteamCmdClient {
     steamcmd_exe: PathBuf,
     /// Active login session handle (kept alive for submit_steam_guard)
     pending_handle: Mutex<Option<ProcessHandle>>,
+    /// Username stored when SteamGuard pauses login (session not yet confirmed)
+    pending_username: Mutex<Option<String>>,
     /// Confirmed session after successful login
     session: Mutex<Option<LoginSession>>,
 }
@@ -28,6 +30,7 @@ impl RealSteamCmdClient {
             wine_path,
             steamcmd_exe,
             pending_handle: Mutex::new(None),
+            pending_username: Mutex::new(None),
             session: Mutex::new(None),
         }
     }
@@ -59,6 +62,7 @@ impl SteamCmdClient for RealSteamCmdClient {
 
             match parse_line(&line) {
                 Some(SteamCmdEvent::SteamGuardPrompt) => {
+                    *self.pending_username.lock().await = Some(username.to_string());
                     *self.pending_handle.lock().await = Some(handle);
                     return Err(SteamCmdError::SteamGuardRequired);
                 }
@@ -95,15 +99,13 @@ impl SteamCmdClient for RealSteamCmdClient {
 
             match parse_line(&line) {
                 Some(SteamCmdEvent::LoggedIn { steam_id }) => {
-                    let session = self
-                        .session
+                    let username = self
+                        .pending_username
                         .lock()
                         .await
-                        .clone()
-                        .unwrap_or_else(|| LoginSession {
-                            steam_id,
-                            username: String::new(),
-                        });
+                        .take()
+                        .unwrap_or_default();
+                    let session = LoginSession { steam_id, username };
                     *self.session.lock().await = Some(session.clone());
                     *guard = None;
                     return Ok(session);
@@ -196,9 +198,46 @@ impl SteamCmdClient for RealSteamCmdClient {
     }
 
     async fn list_owned_apps(&self) -> Result<Vec<u32>, SteamCmdError> {
-        // TODO: parse licenses_print output
-        // Placeholder returns empty list
-        Ok(vec![])
+        let session = self
+            .session
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| SteamCmdError::LoginFailed("Not logged in".into()))?;
+
+        let steamcmd_str = self.steamcmd_exe.to_string_lossy().to_string();
+
+        let handle = self
+            .executor
+            .spawn(
+                &self.wine_path,
+                &[
+                    &steamcmd_str,
+                    "+login",
+                    &session.username,
+                    "+licenses_print",
+                    "+quit",
+                ],
+                &[],
+                None,
+            )
+            .await?;
+
+        let mut handle = handle;
+        let mut all_ids: Vec<u32> = Vec::new();
+
+        while let Some(output) = handle.output_rx.recv().await {
+            let line = match output {
+                ProcessOutput::Stdout(l) | ProcessOutput::Stderr(l) => l,
+            };
+            if let Some(SteamCmdEvent::LicenseApps { app_ids }) = parse_line(&line) {
+                all_ids.extend(app_ids);
+            }
+        }
+
+        all_ids.sort_unstable();
+        all_ids.dedup();
+        Ok(all_ids)
     }
 
     async fn quit(&self) -> Result<(), SteamCmdError> {

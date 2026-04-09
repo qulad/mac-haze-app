@@ -11,6 +11,9 @@ pub enum SteamCmdEvent {
         downloaded_bytes: u64,
         total_bytes: u64,
     },
+    /// Emitted once per package entry from `licenses_print`.
+    /// A single user may have many packages; collect all and deduplicate.
+    LicenseApps { app_ids: Vec<u32> },
     Success,
     Error(String),
 }
@@ -21,6 +24,11 @@ static PROGRESS_RE: Lazy<Regex> = Lazy::new(|| {
 
 static STEAM_ID_RE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"Logged in OK\s*\(?(\d{17})?\)?").expect("valid regex")
+});
+
+// "  - Apps                  : 570 440 730 "
+static LICENSE_APPS_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^\s*-\s*Apps\s*:\s*([\d\s]+)").expect("valid regex")
 });
 
 pub fn parse_line(line: &str) -> Option<SteamCmdEvent> {
@@ -46,6 +54,16 @@ pub fn parse_line(line: &str) -> Option<SteamCmdEvent> {
             downloaded_bytes: caps[2].parse().unwrap_or(0),
             total_bytes: caps[3].parse().unwrap_or(0),
         });
+    }
+
+    if let Some(caps) = LICENSE_APPS_RE.captures(line) {
+        let app_ids: Vec<u32> = caps[1]
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        if !app_ids.is_empty() {
+            return Some(SteamCmdEvent::LicenseApps { app_ids });
+        }
     }
 
     if line.contains("Logged in OK") {
@@ -131,6 +149,34 @@ mod tests {
     #[test]
     fn returns_none_for_unrelated_line() {
         assert_eq!(parse_line("Connecting anonymously to Steam Public..."), None);
+    }
+
+    #[test]
+    fn parses_license_apps_line() {
+        let line = " - Apps                  : 570 440 730 ";
+        assert_eq!(
+            parse_line(line),
+            Some(SteamCmdEvent::LicenseApps {
+                app_ids: vec![570, 440, 730],
+            })
+        );
+    }
+
+    #[test]
+    fn parses_license_apps_single() {
+        let line = " - Apps                  : 550 ";
+        assert_eq!(
+            parse_line(line),
+            Some(SteamCmdEvent::LicenseApps {
+                app_ids: vec![550],
+            })
+        );
+    }
+
+    #[test]
+    fn skips_empty_apps_line() {
+        // Some packages have no apps (DLC-only packages, etc.)
+        assert_eq!(parse_line(" - Apps                  : "), None);
     }
 
     #[test]

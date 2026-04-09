@@ -2,10 +2,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 mod commands;
+mod keychain;
 mod onboarding;
 mod process;
 mod steamcmd;
 
+use keychain::{KeychainStore, RealKeychain};
 use onboarding::{OnboardingSaga, RealOnboardingSaga};
 use process::{ProcessExecutor, TokioProcessExecutor};
 use steamcmd::{RealSteamCmdClient, SteamCmdClient};
@@ -16,6 +18,7 @@ pub struct AppState {
     pub steamcmd: Arc<dyn SteamCmdClient>,
     pub onboarding: Arc<dyn OnboardingSaga>,
     pub executor: Arc<dyn ProcessExecutor>,
+    pub keychain: Arc<dyn KeychainStore>,
     pub wine_path: PathBuf,
     pub wine_prefix: PathBuf,
     pub steamcmd_exe: PathBuf,
@@ -43,13 +46,16 @@ pub fn run() {
         steamcmd_exe.clone(),
     ));
 
+    let keychain: Arc<dyn KeychainStore> = Arc::new(RealKeychain);
+
     let onboarding: Arc<dyn OnboardingSaga> =
-        Arc::new(RealOnboardingSaga::new(steamcmd.clone()));
+        Arc::new(RealOnboardingSaga::new(steamcmd.clone(), keychain.clone()));
 
     let state = AppState {
         steamcmd,
         onboarding,
         executor,
+        keychain,
         wine_path,
         wine_prefix,
         steamcmd_exe,

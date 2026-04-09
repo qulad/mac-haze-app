@@ -1,3 +1,4 @@
 [submodule "web"]
 	path = web
 	url = https://github.com/qulad/mac-haze-web.git
+	branch = main
